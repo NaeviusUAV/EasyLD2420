@@ -1,25 +1,25 @@
 """
-MicroPython driver for the Hi‑Link LD2420 24 GHz mmWave radar sensor.
+MicroPython driver for the Hi-Link LD2420 24GHz mmWave radar sensor.
 
 This module exposes a single class, :class:`LD2420`, which wraps the
-low‑level serial protocol used by the LD2420 and presents a friendly
+low level serial protocol used by the LD2420 and presents a friendly
 Pythonic API.  It is designed to run on MicroPython (such as an ESP32)
 but includes a limited set of stub definitions so that it can be
-imported and unit‑tested under normal CPython on a desktop computer.
+imported and unit tested under normal CPython on a desktop computer.
 
 The implementation is based on the published command protocol for the
 LD2420.  Each command frame consists of a four byte header,
-a two byte little‑endian length, a two byte command word, zero or more
+a two byte little endian length, a two byte command word, zero or more
 payload bytes and a four byte footer.  The driver hides the framing
 details from the user.  For streaming operation the module can be put
 into “energy output” mode where it reports a presence flag, an
-estimated distance and sixteen 16‑bit gate energy values for a 4×4
+estimated distance and sixteen 16 bit gate energy values for a 4x4
 grid.  See the accompanying README or the official datasheet for more
 details.
 
 Because the LD2420 can be shipped with different firmware versions,
 the TX and RX pins may swap between OT1 and OT2 and the default
-baudrate may vary (256 000 bps on older firmware, 115 200 bps on newer
+baudrate may vary (256 000 bps on older firmware, 115 200 bps on newer
 firmware).  The constructor therefore performs an initial handshake
 using the provided pin assignments and optionally retries with the
 pins swapped and an alternate baudrate.  If communication cannot be
@@ -68,7 +68,7 @@ try:
     TimeoutError
 except NameError:  # pragma: no cover
     class TimeoutError(OSError):
-        """Fallback for boards that omit CPython’s TimeoutError."""
+        """Fallback for boards that omit CPythons TimeoutError."""
         pass
 
 try:
@@ -120,7 +120,7 @@ except ImportError:  # pragma: no cover - fall back for CPython unit tests
 
 
 class LD2420:
-    """Driver class for the Hi‑Link LD2420 radar module.
+    """Driver class for the Hi-Link LD2420 radar module.
 
     The driver encapsulates the serial protocol used by the LD2420 and
     exposes methods to start and stop streaming, read version
@@ -228,8 +228,10 @@ class LD2420:
                 n = self._uart.readinto(tmp)
                 if n:
                     self._buf.extend(tmp[:n])
+                    
                     if self.debug:
-                        print("[RX]", tmp[:n])
+                        tmp[:n]
+                        #print("[RX]", tmp[:n])
             frame = self._extract_frame()
             if frame is not None:
                 # Determine if this is a streaming (energy) frame or a command/ack frame
@@ -313,28 +315,69 @@ class LD2420:
             self.write_register(still_reg, thr, verify=False)
         self._send_command(self._CMD_DISABLE_CONFIG, b"")
 
-    def set_refresh_rate(self, rate_hz: int) -> None:
+    def set_refresh_rate(self, rate_hz: int, rate_ms: int) -> None:
         if rate_hz <= 0:
             raise ValueError("refresh rate must be positive")
-        self._refresh_interval_ms = int(1000 / rate_hz)
+        if rate_hz:
+            self._refresh_interval_ms = int(1000 / rate_hz)
+        if rate_ms:
+            self._refresh_interval_ms = int(rate_ms)
 
-    def set_detection_range(self, min_cm: int, max_cm: int) -> None:
+    def set_detection_range(self, min_cm: int, max_cm: int, auto_restart=True) -> None:
+        # sanity
         if min_cm >= max_cm:
-            raise ValueError("min_cm must be less than max_cm")
-        if not (30 <= min_cm <= 800 and 30 <= max_cm <= 800):
-            raise ValueError("detection range must be between 30 and 800 cm")
-        gate_size_cm = 7.5
-        min_gate = int(min_cm / gate_size_cm)
-        max_gate = int(max_cm / gate_size_cm)
-        if min_gate < 0:
-            min_gate = 0
-        if max_gate > 15:
-            max_gate = 15
-        self._send_command(self._CMD_ENABLE_CONFIG, b"\x02\x00")
-        self.write_register(0x0000, min_gate, verify=False)
-        self.write_register(0x0001, max_gate, verify=False)
-        self._send_command(self._CMD_DISABLE_CONFIG, b"")
+            raise ValueError("min_cm must be < max_cm")
+        if not (0 <= min_cm <= 1120 and 0 <= max_cm <= 1120):
+            raise ValueError("values must lie between 0 cm and ≈ 11 m")
 
+        GATE_SIZE_CM = 70  # one hardware bin ≈ 0.7 m 
+         
+        min_gate = min_cm // GATE_SIZE_CM
+        max_gate = (max_cm + GATE_SIZE_CM - 1) // GATE_SIZE_CM
+        
+        min_gate = max(1, min(15, min_gate))
+        max_gate = max(2, min(15, max_gate))
+        if min_gate >= max_gate:
+            min_gate = 1  # if window would collapse, default to starting at gate 0
+            max_gate = min(2, 15)  # and use at least one gate
+
+        if self.debug:
+            print('the min max for detection range in gates is: ',min_gate, max_gate)
+
+        def _safe_write_gate_window(self, g_min: int, g_max: int):
+            if not (1 <= g_min < g_max <= 15):
+                raise ValueError("gate range must be 1-15 and min < max")
+
+            was_running = self._running
+            if was_running:
+                self.stop()
+
+            self._send_command(self._CMD_ENABLE_CONFIG, b"\x02\x00")
+            try:
+                self.write_register(0x0000, g_min, verify=False)
+                self.write_register(0x0001, g_max, verify=False)
+            finally:
+                self._send_command(self._CMD_DISABLE_CONFIG, b"")
+
+            # flush any ACK still in the UART FIFO
+            try:
+                while self._uart.any():
+                    self._uart.read(self._uart.any())
+            except Exception as exc:
+                if self.debug:
+                    print(f'when trying to flush ACK in safe write gate window helper i got this problem: {exc}')
+                else:
+                    print('\n')
+            if was_running:
+                self.start(verify=False)
+        try:
+            _safe_write_gate_window(self, min_gate, max_gate)
+        except Exception as exc:
+            if self.debug:
+                print('failed to call the safe write gate window helper (for set_detection_range() function)')
+                print(f'details: {exc}')
+            else:
+                print(exc)
     def read_register(self, reg_addr: int) -> int:
         if not 0 <= reg_addr <= 0xFFFF:
             raise ValueError("register address out of range")
@@ -534,8 +577,8 @@ class LD2420:
 
             Presence (1 byte):        0 = none, 1 = motion detected
             Distance (2 bytes LE):    distance in cm
-            Energy[0..15] (2 bytes): 16 little‑endian values representing reflected
-                                    energy in gates 0–15
+            Energy[0..15] (2 bytes): 16 little endian values representing reflected
+                                    energy in gates 0 15
 
         Any remaining bytes after the 16 energies are stored in the `extra` dictionary
         under the key `'raw'`.  If the frame appears to be an acknowledgement or its
